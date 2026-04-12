@@ -1,225 +1,478 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import time
+
+import json
 import os
-from utils import *
-import torch.nn.functional as F
-from torch import nn
-from torch import optim
-import torch
-import math
+import random
+import time
+import warnings
+from typing import Dict, Tuple
+
 import numpy as np
 import scipy.sparse as sp
-from scipy.sparse import coo_matrix
-from config import args
-from link_prediction import link_prediction
-from evolution import calc_raw_mrr, calc_filtered_mrr, calc_filtered_test_mrr
-import codecs
-import json
-from tensorboardX import SummaryWriter
-import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+from torch import optim
 
+from config import (
+    args,
+    ensure_dir,
+    get_branch_checkpoint_path,
+    get_branch_ckpt_dir,
+    get_branch_result_path,
+    get_branch_run_dir,
+    resolve_use_history_gate,
+)
+from evolution import calc_filtered_mrr, calc_raw_mrr
+from history_validity_gate import read_triples, build_train_and_train_valid_histories
+from link_prediction import link_prediction
+from utils import get_total_number, load_quadruples
+
+warnings.filterwarnings(action="ignore")
 torch.set_num_threads(2)
 
-import warnings
-warnings.filterwarnings(action='ignore')
+
+def set_seed(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
-def mkdirs(path):
-	if not os.path.exists(path):
-		os.makedirs(path)
+def save_json(obj, path: str) -> None:
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
 
 
-use_cuda = args.gpu >= 0 and torch.cuda.is_available()
-device = torch.device("cuda" if use_cuda else "cpu")
+def load_dataset():
+    data_dir = os.path.join(args.data_root, args.dataset)
+    train_data, train_times = load_quadruples(data_dir, "train.txt")
+    valid_data, valid_times = load_quadruples(data_dir, "valid.txt")
+    test_data, test_times = load_quadruples(data_dir, "test.txt")
+    num_e, num_r = get_total_number(data_dir, "stat.txt")
+    all_times = np.concatenate([train_times, valid_times, test_times])
+    num_times = int(max(all_times) / args.time_stamp) + 1
+    return {
+        "data_dir": data_dir,
+        "train_data": train_data,
+        "train_times": train_times,
+        "valid_data": valid_data,
+        "valid_times": valid_times,
+        "test_data": test_data,
+        "test_times": test_times,
+        "num_e": num_e,
+        "num_r": num_r,
+        "num_times": num_times,
+    }
 
-if args.dataset == 'ICEWS14':
-	train_data, train_times = load_quadruples('./data/{}'.format(args.dataset), 'train.txt')
-	test_data, test_times = load_quadruples('./data/{}'.format(args.dataset), 'test.txt')
-	dev_data, dev_times = load_quadruples('./data/{}'.format(args.dataset), 'test.txt')
-else:
-	train_data, train_times = load_quadruples('./data/{}'.format(args.dataset), 'train.txt')
-	test_data, test_times = load_quadruples('./data/{}'.format(args.dataset), 'test.txt')
-	dev_data, dev_times = load_quadruples('./data/{}'.format(args.dataset), 'valid.txt')
 
-all_times = np.concatenate([train_times, dev_times, test_times])
+def history_npz_path(dataset: str, data_root: str, entity: str, timestamp: int) -> str:
+    subdir = "copy_seq" if entity == "object" else "copy_seq_sub"
+    return os.path.join(data_root, dataset, subdir, f"train_h_r_copy_seq_{int(timestamp)}.npz")
 
-num_e, num_r = get_total_number('./data/{}'.format(args.dataset), 'stat.txt')
-num_times = int(max(all_times) / args.time_stamp) + 1
-print('num_times', num_times)
 
-train_samples = []
-for tim in train_times:
-	print(str(tim)+'\t'+str(max(train_times)))
-	data = get_data_with_t(train_data, tim)
-	train_samples.append(len(data))
+def load_history_npz(dataset: str, data_root: str, entity: str, timestamp: int) -> sp.csr_matrix:
+    return sp.load_npz(history_npz_path(dataset, data_root, entity, timestamp)).astype(np.float32).tocsr()
 
-model = link_prediction(num_e, args.hidden_dim, num_r, num_times, use_cuda)
-model.to(device)
 
-optimizer = optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
+def build_full_train_history_matrix(
+    dataset: str,
+    data_root: str,
+    entity: str,
+    train_times: np.ndarray,
+    num_e: int,
+    num_r: int,
+) -> sp.csr_matrix:
+    matrix = sp.csr_matrix((num_e * num_r, num_e), dtype=np.float32)
+    for ts in train_times:
+        matrix = matrix + load_history_npz(dataset, data_root, entity, int(ts))
+    return matrix
 
-if args.entity == 'object':
-	mkdirs('./results/bestmodel/{}'.format(args.dataset))
-	model_state_file = './results/bestmodel/{}/model_state.pth'.format(args.dataset)
-if args.entity == 'subject':
-	mkdirs('./results/bestmodel/{}_sub'.format(args.dataset))
-	model_state_file = './results/bestmodel/{}_sub/model_state.pth'.format(args.dataset)
 
-forward_time = []
-backward_time = []
+def build_batch_copy_inputs(
+    history_matrix: sp.csr_matrix,
+    batch_data: np.ndarray,
+    num_r: int,
+    entity: str,
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if entity == "object":
+        labels = torch.LongTensor(batch_data[:, 2])
+        seq_idx = batch_data[:, 0] * num_r + batch_data[:, 1]
+    elif entity == "subject":
+        labels = torch.LongTensor(batch_data[:, 0])
+        seq_idx = batch_data[:, 2] * num_r + batch_data[:, 1]
+    else:
+        raise ValueError(f"Unsupported entity branch: {entity}")
 
-best_mrr = 0
-best_hits1 = 0
-best_hits3 = 0
-best_hits10 = 0
+    tail_seq = np.asarray(history_matrix[seq_idx].todense(), dtype=np.float32)
+    one_hot_tail_seq = torch.from_numpy(tail_seq)
+    one_hot_tail_seq = one_hot_tail_seq.masked_fill(one_hot_tail_seq != 0, 1.0)
 
-batch_size = args.batch_size
-mkdirs('./scalar/{}/'.format(args.dataset))
-writer = SummaryWriter(log_dir='scalar/{}/'.format(args.dataset))
+    return labels.to(device), one_hot_tail_seq.to(device)
 
-print('start train')
-n = 0
 
-for i in range(args.n_epochs):
-	train_loss = 0
-	sample_read = 0
-	sample_end = 0
-	all_tail_seq = sp.csr_matrix(([], ([], [])), shape=(num_e * num_r, num_e))
-	for train_samples_tim in range(len(train_samples)):
-		model.train()
-		sample_end += train_samples[train_samples_tim]
+@torch.no_grad()
+def evaluate_valid(
+    model: link_prediction,
+    train_data: np.ndarray,
+    valid_data: np.ndarray,
+    full_train_history: sp.csr_matrix,
+    num_e: int,
+    num_r: int,
+    device: torch.device,
+    history_context,
+) -> Dict[str, float]:
+    model.eval()
 
-		if train_samples_tim > 0:
-			train_tim = train_times[train_samples_tim-1]
-			if args.entity == 'object':
-				tim_tail_seq = sp.load_npz('./data/{}/copy_seq/train_h_r_copy_seq_{}.npz'.format(args.dataset, train_times[train_samples_tim - 1]))
-			if args.entity == 'subject':
-				tim_tail_seq = sp.load_npz('./data/{}/copy_seq_sub/train_h_r_copy_seq_{}.npz'.format(args.dataset, train_times[train_samples_tim - 1]))
-			all_tail_seq = all_tail_seq + tim_tail_seq
+    total_mrr = 0.0
+    total_hits1 = 0.0
+    total_hits3 = 0.0
+    total_hits10 = 0.0
+    total_examples = 0
 
-		train_sample_data = train_data[sample_read:sample_end, :]
+    n_batch = (valid_data.shape[0] + args.batch_size - 1) // args.batch_size
+    if args.smoke and args.max_eval_batches > 0:
+        n_batch = min(n_batch, args.max_eval_batches)
 
-		n_batch = (train_sample_data.shape[0] + batch_size - 1) // batch_size
-		for idx in range(n_batch):
-			batch_start = idx * batch_size
-			batch_end = min(train_sample_data.shape[0], (idx + 1) * batch_size)
-			train_batch_data = train_sample_data[batch_start: batch_end]
+    for batch_idx in range(n_batch):
+        batch_start = batch_idx * args.batch_size
+        batch_end = min(valid_data.shape[0], (batch_idx + 1) * args.batch_size)
+        valid_batch_data = valid_data[batch_start:batch_end]
 
-			if args.entity == 'object':
-				labels = torch.LongTensor(train_batch_data[:, 2])
-				seq_idx = train_batch_data[:, 0] * num_r + train_batch_data[:, 1]
-			if args.entity == 'subject':
-				labels = torch.LongTensor(train_batch_data[:, 0])
-				seq_idx = train_batch_data[:, 2] * num_r + train_batch_data[:, 1]
+        labels, one_hot_tail_seq = build_batch_copy_inputs(
+            history_matrix=full_train_history,
+            batch_data=valid_batch_data,
+            num_r=num_r,
+            entity=args.entity,
+            device=device,
+        )
 
-			tail_seq = torch.Tensor(all_tail_seq[seq_idx].todense())
-			one_hot_tail_seq = tail_seq.masked_fill(tail_seq != 0, 1)
+        valid_score = model(
+            valid_batch_data,
+            one_hot_tail_seq,
+            entity=args.entity,
+            history_context=history_context,
+        )
 
-			if use_cuda:
-				labels, one_hot_tail_seq = labels.to(device), one_hot_tail_seq.to(device)
+        if args.raw:
+            mrr, hits1, hits3, hits10 = calc_raw_mrr(valid_score, labels, hits=[1, 3, 10])
+        else:
+            mrr, hits1, hits3, hits10 = calc_filtered_mrr(
+                num_e,
+                valid_score,
+                torch.LongTensor(train_data),
+                torch.LongTensor(valid_data),
+                torch.LongTensor(valid_batch_data),
+                entity=args.entity,
+                hits=[1, 3, 10],
+            )
 
-			t0 = time.time()
-			score = model(train_batch_data, one_hot_tail_seq, entity=args.entity)
+        batch_n = len(valid_batch_data)
+        total_mrr += mrr * batch_n
+        total_hits1 += hits1 * batch_n
+        total_hits3 += hits3 * batch_n
+        total_hits10 += hits10 * batch_n
+        total_examples += batch_n
 
-			loss = F.nll_loss(score, labels) + model.regularization_loss(reg_param=0.01)
+    total_examples = max(total_examples, 1)
+    return {
+        "MRR": total_mrr / total_examples,
+        "Hits@1": total_hits1 / total_examples,
+        "Hits@3": total_hits3 / total_examples,
+        "Hits@10": total_hits10 / total_examples,
+        "count": total_examples,
+    }
 
-			train_loss += loss.item()
 
-			t1 = time.time()
-			loss.backward()
-			optimizer.step()
-			t2 = time.time()
+def build_model(num_e: int, num_r: int, num_times: int, use_cuda: bool) -> link_prediction:
+    return link_prediction(
+        i_dim=num_e,
+        h_dim=args.hidden_dim,
+        num_rels=num_r,
+        num_times=num_times,
+        time_stamp=args.time_stamp,
+        alpha=args.alpha,
+        use_cuda=use_cuda,
+        use_history_gate=resolve_use_history_gate(args),
+        hva_topk=args.hva_topk,
+        hva_mode=args.hva_mode,
+        hva_gamma_exact=args.hva_gamma_exact,
+        hva_gamma_near=args.hva_gamma_near,
+        hva_stale_init=args.hva_stale_init,
+    )
 
-			writer.add_scalar('{}_loss'.format(args.dataset), loss.item(), n)
-			n += 1
 
-			forward_time.append(t1 - t0)
-			backward_time.append(t2 - t1)
-			optimizer.zero_grad()
+def main():
+    if args.entity not in {"object", "subject"}:
+        raise ValueError("train.py only supports --entity object or --entity subject")
 
-		sample_read += train_samples[train_samples_tim]
+    set_seed(args.seed)
 
-	if i>=args.valid_epoch:
-		mrr, hits1, hits3, hits10 = 0,0,0,0
+    use_cuda = args.gpu >= 0 and torch.cuda.is_available()
+    device = torch.device(f"cuda:{args.gpu}" if use_cuda else "cpu")
 
-		dev_sample_read = 0
-		dev_sample_end = 0
-		if args.entity == 'object':
-			tim_tail_seq = sp.load_npz('./data/{}/copy_seq/train_h_r_copy_seq_{}.npz'.format(args.dataset, train_times[-1]))
-		if args.entity == 'subject':
-			tim_tail_seq = sp.load_npz('./data/{}/copy_seq_sub/train_h_r_copy_seq_{}.npz'.format(args.dataset, train_times[-1]))
-		all_tail_seq = all_tail_seq + tim_tail_seq
+    data = load_dataset()
+    train_data = data["train_data"]
+    train_times = data["train_times"]
+    valid_data = data["valid_data"]
+    num_e = data["num_e"]
+    num_r = data["num_r"]
+    num_times = data["num_times"]
 
-		n_batch = (dev_data.shape[0] + batch_size - 1) // batch_size
+    run_dir = ensure_dir(get_branch_run_dir(args, branch=args.entity))
+    ckpt_dir = ensure_dir(get_branch_ckpt_dir(args, branch=args.entity))
+    reports_dir = ensure_dir(os.path.join(run_dir, "reports"))
+    dump_dir = ensure_dir(os.path.join(run_dir, "dumps"))
 
-		for idx in range(n_batch):
-			batch_start = idx * batch_size
-			batch_end = min(dev_data.shape[0], (idx + 1) * batch_size)
-			dev_batch_data = dev_data[batch_start: batch_end]
+    train_log_path = os.path.join(run_dir, "training_log.json")
+    train_summary_path = os.path.join(reports_dir, "train_summary.json")
 
-			if args.entity == 'object':
-				dev_label = torch.LongTensor(dev_batch_data[:, 2])
-				seq_idx = dev_batch_data[:, 0] * num_r + dev_batch_data[:, 1]
-			if args.entity == 'subject':
-				dev_label = torch.LongTensor(dev_batch_data[:, 0])
-				seq_idx = dev_batch_data[:, 2] * num_r + dev_batch_data[:, 1]
+    model = build_model(num_e=num_e, num_r=num_r, num_times=num_times, use_cuda=use_cuda).to(device)
+    optimizer = optim.Adam(model.parameters(), lr=args.lr, amsgrad=True)
 
-			tail_seq = torch.Tensor(all_tail_seq[seq_idx].todense())
-			one_hot_tail_seq = tail_seq.masked_fill(tail_seq != 0, 1)
+    use_history_gate = resolve_use_history_gate(args)
+    train_history_context = None
+    if use_history_gate:
+        train_triples = read_triples(os.path.join(data["data_dir"], "train.txt"))
+        valid_triples = read_triples(os.path.join(data["data_dir"], "valid.txt"))
+        train_hist, _ = build_train_and_train_valid_histories(train_triples, valid_triples, num_r)
+        train_history_context = train_hist
 
-			if use_cuda:
-				dev_label, one_hot_tail_seq = dev_label.to(device), one_hot_tail_seq.to(device)
-			dev_score = model(dev_batch_data, one_hot_tail_seq, entity=args.entity)
-			
-			if args.raw:
-				tim_mrr, tim_hits1, tim_hits3, tim_hits10 = calc_raw_mrr(dev_score, dev_label, hits=[1, 3, 10])
-			else:
-				tim_mrr, tim_hits1, tim_hits3, tim_hits10 = calc_filtered_mrr(num_e, 
-											      dev_score, 
-											      torch.LongTensor(train_data),
-										              torch.LongTensor(dev_data),
-											      torch.LongTensor(dev_batch_data),
-											      entity=args.entity,
-											      hits=[1, 3, 10])
+    full_train_history = build_full_train_history_matrix(
+        dataset=args.dataset,
+        data_root=args.data_root,
+        entity=args.entity,
+        train_times=train_times,
+        num_e=num_e,
+        num_r=num_r,
+    )
 
-			mrr += tim_mrr * len(dev_batch_data)
-			hits1 += tim_hits1 * len(dev_batch_data)
-			hits3 += tim_hits3 * len(dev_batch_data)
-			hits10 += tim_hits10 * len(dev_batch_data)
+    best_mrr = 0.0
+    best_epoch = -1
+    non_improve_rounds = 0
+    start_epoch = 0
 
-		mrr = mrr / dev_data.shape[0]
-		hits1 = hits1 / dev_data.shape[0]
-		hits3 = hits3 / dev_data.shape[0]
-		hits10 = hits10 / dev_data.shape[0]
-		print("MRR : {:.6f}".format(mrr))
-		print("Hits @ 1: {:.6f}".format(hits1))
-		print("Hits @ 3: {:.6f}".format(hits3))
-		print("Hits @ 10: {:.6f}".format(hits10))
+    if args.resume_ckpt:
+        checkpoint = torch.load(args.resume_ckpt, map_location=device)
+        model.load_state_dict(checkpoint["state_dict"])
+        if "optimizer" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer"])
+        best_mrr = float(checkpoint.get("best_mrr", 0.0))
+        best_epoch = int(checkpoint.get("epoch", -1))
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
 
-		if mrr > best_mrr:
-			best_mrr = mrr
-			torch.save({'state_dict': model.state_dict(), 'epoch': i+1},
-					   model_state_file)
-			count = 0
-		else:
-			count += 1
-		
-		if hits1 > best_hits1:
-			best_hits1 = hits1
-		if hits3 > best_hits3:
-			best_hits3 = hits3
-		if hits10 > best_hits10:
-			best_hits10 = hits10
-		
-		print("Epoch {:04d} | Loss {:.4f} | Best MRR {:.4f} | Hits@1 {:.4f} | Hits@3 {:.4f} | Hits@10 {:.4f} | Forward {:.4f}s | Backward {:.4f}s".
-			  format(i+1, train_loss, best_mrr, best_hits1, best_hits3, best_hits10, forward_time[-1], backward_time[-1]))
-		
-		if count == args.counts:
-			break
-		
-writer.close()
+    train_log = {
+        "config": vars(args),
+        "epochs": [],
+        "best_mrr": best_mrr,
+        "best_epoch": best_epoch,
+        "run_dir": run_dir,
+        "checkpoints": {
+            "latest": get_branch_checkpoint_path(args, branch=args.entity, which="latest"),
+            "best": get_branch_checkpoint_path(args, branch=args.entity, which="best"),
+        },
+    }
 
-print("training done")
-print("Mean forward time: {:4f}s".format(np.mean(forward_time)))
-print("Mean Backward time: {:4f}s".format(np.mean(backward_time)))
+    history_time_indices = list(range(1, len(train_times)))
+    if args.smoke and args.max_train_times > 0:
+        history_time_indices = history_time_indices[:args.max_train_times]
+
+    print(f"start train | entity={args.entity} | use_history_gate={use_history_gate} | run_dir={run_dir}")
+
+    for epoch in range(start_epoch, args.n_epochs):
+        model.train()
+
+        cumulative_history = sp.csr_matrix((num_e * num_r, num_e), dtype=np.float32)
+
+        epoch_losses = []
+        epoch_forward_times = []
+        epoch_backward_times = []
+
+        for history_pos in history_time_indices:
+            prev_time = int(train_times[history_pos - 1])
+            current_time = int(train_times[history_pos])
+
+            cumulative_history = cumulative_history + load_history_npz(
+                dataset=args.dataset,
+                data_root=args.data_root,
+                entity=args.entity,
+                timestamp=prev_time,
+            )
+
+            train_sample_data = train_data[train_data[:, 3] == current_time]
+            if len(train_sample_data) == 0:
+                continue
+
+            batch_order = np.arange(len(train_sample_data))
+            np.random.shuffle(batch_order)
+            train_sample_data = train_sample_data[batch_order]
+
+            n_batch = (train_sample_data.shape[0] + args.batch_size - 1) // args.batch_size
+
+            for batch_idx in range(n_batch):
+                batch_start = batch_idx * args.batch_size
+                batch_end = min(train_sample_data.shape[0], (batch_idx + 1) * args.batch_size)
+                train_batch_data = train_sample_data[batch_start:batch_end]
+
+                labels, one_hot_tail_seq = build_batch_copy_inputs(
+                    history_matrix=cumulative_history,
+                    batch_data=train_batch_data,
+                    num_r=num_r,
+                    entity=args.entity,
+                    device=device,
+                )
+
+                optimizer.zero_grad(set_to_none=True)
+
+                t0 = time.time()
+                score = model(
+                    train_batch_data,
+                    one_hot_tail_seq,
+                    entity=args.entity,
+                    history_context=train_history_context,
+                )
+                t1 = time.time()
+
+                if use_history_gate:
+                    loss_main = F.cross_entropy(score, labels)
+                else:
+                    loss_main = F.nll_loss(score, labels)
+
+                loss = loss_main + model.regularization_loss(reg_param=args.regularization)
+                loss.backward()
+                optimizer.step()
+                t2 = time.time()
+
+                epoch_losses.append(float(loss.item()))
+                epoch_forward_times.append(t1 - t0)
+                epoch_backward_times.append(t2 - t1)
+
+        epoch_row = {
+            "epoch": epoch + 1,
+            "train_loss": float(np.mean(epoch_losses)) if epoch_losses else None,
+            "forward_time_mean": float(np.mean(epoch_forward_times)) if epoch_forward_times else None,
+            "backward_time_mean": float(np.mean(epoch_backward_times)) if epoch_backward_times else None,
+            "val_mrr_filter": None,
+            "val_hits1_filter": None,
+            "val_hits3_filter": None,
+            "val_hits10_filter": None,
+            "is_best": False,
+        }
+
+        if args.save_latest:
+            latest_path = get_branch_checkpoint_path(args, branch=args.entity, which="latest")
+            ensure_dir(os.path.dirname(latest_path))
+            torch.save(
+                {
+                    "state_dict": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "epoch": epoch,
+                    "best_mrr": best_mrr,
+                    "config": vars(args),
+                },
+                latest_path,
+            )
+
+        if (epoch + 1) >= args.valid_epoch:
+            valid_metrics = evaluate_valid(
+                model=model,
+                train_data=train_data,
+                valid_data=valid_data,
+                full_train_history=full_train_history,
+                num_e=num_e,
+                num_r=num_r,
+                device=device,
+                history_context=train_history_context,
+            )
+
+            current_mrr = float(valid_metrics["MRR"])
+            epoch_row["val_mrr_filter"] = current_mrr
+            epoch_row["val_hits1_filter"] = float(valid_metrics["Hits@1"])
+            epoch_row["val_hits3_filter"] = float(valid_metrics["Hits@3"])
+            epoch_row["val_hits10_filter"] = float(valid_metrics["Hits@10"])
+
+            print(
+                f"valid | epoch={epoch + 1:04d} | MRR={current_mrr:.6f} | "
+                f"H@1={valid_metrics['Hits@1']:.6f} | H@3={valid_metrics['Hits@3']:.6f} | "
+                f"H@10={valid_metrics['Hits@10']:.6f}"
+            )
+
+            if current_mrr > best_mrr:
+                best_mrr = current_mrr
+                best_epoch = epoch + 1
+                non_improve_rounds = 0
+                epoch_row["is_best"] = True
+
+                if args.save_best:
+                    best_path = get_branch_checkpoint_path(args, branch=args.entity, which="best")
+                    ensure_dir(os.path.dirname(best_path))
+                    torch.save(
+                        {
+                            "state_dict": model.state_dict(),
+                            "optimizer": optimizer.state_dict(),
+                            "epoch": epoch,
+                            "best_mrr": best_mrr,
+                            "config": vars(args),
+                        },
+                        best_path,
+                    )
+            else:
+                non_improve_rounds += 1
+
+        train_log["best_mrr"] = float(best_mrr)
+        train_log["best_epoch"] = int(best_epoch)
+        train_log["epochs"].append(epoch_row)
+        save_json(train_log, train_log_path)
+
+        print(
+            "epoch {:04d} | loss {:.6f} | best_mrr {:.6f} | forward {:.6f}s | backward {:.6f}s".format(
+                epoch + 1,
+                float(np.mean(epoch_losses)) if epoch_losses else float("nan"),
+                best_mrr,
+                float(np.mean(epoch_forward_times)) if epoch_forward_times else 0.0,
+                float(np.mean(epoch_backward_times)) if epoch_backward_times else 0.0,
+            )
+        )
+
+        if (epoch + 1) >= args.valid_epoch and non_improve_rounds >= args.counts:
+            print(f"Early stopping triggered at epoch {epoch + 1}.")
+            break
+
+    best_path = get_branch_checkpoint_path(args, branch=args.entity, which="best")
+    latest_path = get_branch_checkpoint_path(args, branch=args.entity, which="latest")
+    if args.save_best and not os.path.exists(best_path):
+        ensure_dir(os.path.dirname(best_path))
+        torch.save(
+            {
+                "state_dict": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "epoch": max(best_epoch - 1, 0),
+                "best_mrr": best_mrr,
+                "config": vars(args),
+            },
+            best_path,
+        )
+
+    train_summary = {
+        "row_name": args.row_name,
+        "method": args.method,
+        "entity": args.entity,
+        "use_history_gate": use_history_gate,
+        "hva_mode": args.hva_mode,
+        "best_epoch": int(best_epoch),
+        "best_valid_mrr": float(best_mrr),
+        "checkpoint_latest": latest_path if args.save_latest else "",
+        "checkpoint_best": best_path if args.save_best else "",
+        "training_log_path": train_log_path,
+        "dump_dir": dump_dir,
+    }
+    save_json(train_summary, train_summary_path)
+
+    print("training done")
+    print(json.dumps(train_summary, indent=2))
+
+
+if __name__ == "__main__":
+    main()
