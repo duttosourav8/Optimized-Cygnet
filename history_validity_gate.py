@@ -29,6 +29,7 @@ def read_triples(path: str) -> List[Triple]:
             triples.append((s, r, o, t))
     return triples
 
+
 def augment_with_inverse(triples: List[Triple], num_rels: int) -> List[Triple]:
     aug: List[Triple] = []
     for s, r, o, t in triples:
