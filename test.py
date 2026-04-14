@@ -386,6 +386,12 @@ def evaluate_branch(
     if args.smoke and args.max_eval_batches > 0:
         n_batch = min(n_batch, args.max_eval_batches)
 
+    print(
+        f"start eval | row={args.row_name} | split={split} | branch={entity} | "
+        f"batches={n_batch} | batch_size={args.batch_size} | dump={dump_requested}",
+        flush=True,
+    )
+
     for batch_idx in range(n_batch):
         batch_start = batch_idx * args.batch_size
         batch_end = min(eval_data.shape[0], (batch_idx + 1) * args.batch_size)
@@ -463,9 +469,27 @@ def evaluate_branch(
             all_scores.append(scores_np)
             all_triples.append(triples_np)
 
+        if batch_idx == 0 or (batch_idx + 1) % 20 == 0 or (batch_idx + 1) == n_batch:
+            print(
+                f"eval progress | row={args.row_name} | split={split} | branch={entity} | "
+                f"batch={batch_idx + 1}/{n_batch}",
+                flush=True,
+            )
+
+    print(
+        f"finished eval loop | row={args.row_name} | split={split} | branch={entity} | "
+        f"count={native_count}",
+        flush=True,
+    )
+
     if dump_requested:
         all_scores_np = np.concatenate(all_scores, axis=0)
         all_triples_np = np.concatenate(all_triples, axis=0)
+
+        print(
+            f"saving dump | row={args.row_name} | split={split} | branch={entity} | path={dump_path}",
+            flush=True,
+        )
 
         ensure_dir(os.path.dirname(dump_path))
         np.savez_compressed(
@@ -536,14 +560,12 @@ def main():
     valid_filter_map = build_filter_map_from_arrays([train_data, valid_data], num_r)
     test_filter_map = build_filter_map_from_arrays([train_data, valid_data, test_data], num_r)
 
-    branches: List[str]
     if args.entity == "combined":
-        branches = ["object", "subject"]
+        branches: List[str] = ["object", "subject"]
     else:
         branches = [args.entity]
 
     split_list = ["valid", "test"] if args.eval_split == "both" else [args.eval_split]
-
     branch_results = {split: {} for split in split_list}
 
     for branch in branches:
@@ -569,7 +591,12 @@ def main():
             num_r=num_r,
         )
 
-        model = build_model(num_e=num_e, num_r=num_r, num_times=num_times, use_cuda=use_cuda).to(device)
+        model = build_model(
+            num_e=num_e,
+            num_r=num_r,
+            num_times=num_times,
+            use_cuda=use_cuda,
+        ).to(device)
 
         for split in split_list:
             if split == "valid":
@@ -627,7 +654,7 @@ def main():
             if args.print_priority_block:
                 print_priority_result_block(combined)
 
-    print("evaluation done")
+    print("evaluation done", flush=True)
 
 
 if __name__ == "__main__":
