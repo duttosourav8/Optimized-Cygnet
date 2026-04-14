@@ -199,7 +199,15 @@ def finalize_bucket_stats(bucket_stats: Dict[str, Dict[str, float]]) -> Dict[str
     return out
 
 
-def evaluate_bucket_and_stale(
+def init_bucket_stats() -> Dict[str, Dict[str, float]]:
+    return {
+        "repeat": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
+        "near_repeat": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
+        "novel": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
+    }
+
+
+def update_bucket_and_stale_from_batch(
     scores_np: np.ndarray,
     triples_np: np.ndarray,
     entity: str,
@@ -208,18 +216,11 @@ def evaluate_bucket_and_stale(
     sr_hist,
     so_hist,
     ro_hist,
-):
+    bucket_stats: Dict[str, Dict[str, float]],
+    stale_state: Dict[str, int],
+) -> None:
     canonical_queries = canonicalize_cygnet_queries(triples_np, entity=entity, num_rels=num_r)
     top1 = np.argmax(scores_np, axis=1)
-
-    bucket_stats = {
-        "repeat": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
-        "near_repeat": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
-        "novel": {"MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0, "count": 0},
-    }
-
-    stale_total = 0
-    stale_count = 0
 
     for i in range(len(triples_np)):
         s, r, o, t = map(int, canonical_queries[i][:4])
@@ -238,17 +239,11 @@ def evaluate_bucket_and_stale(
         bucket_stats[bucket]["count"] += 1
 
         if bucket in {"near_repeat", "novel"}:
-            stale_total += 1
+            stale_state["count"] += 1
             pred_o = int(top1[i])
             pred_bucket = stale_exact_bucket(s, r, pred_o, t, sr_hist)
             if pred_bucket == "stale":
-                stale_count += 1
-
-    return finalize_bucket_stats(bucket_stats), {
-        "count": int(stale_total),
-        "stale_top1_count": int(stale_count),
-        "stale_top1_rate": safe_div(stale_count, stale_total),
-    }
+                stale_state["stale_top1_count"] += 1
 
 
 def average_branch_results(obj_result: Dict, sub_result: Dict, split: str) -> Dict:
@@ -284,8 +279,12 @@ def average_branch_results(obj_result: Dict, sub_result: Dict, split: str) -> Di
 
     all_buckets = set(obj_result["bucket_metrics_filtered"].keys()) | set(sub_result["bucket_metrics_filtered"].keys())
     for bucket in all_buckets:
-        obj_bucket = obj_result["bucket_metrics_filtered"].get(bucket, {"count": 0, "MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0})
-        sub_bucket = sub_result["bucket_metrics_filtered"].get(bucket, {"count": 0, "MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0})
+        obj_bucket = obj_result["bucket_metrics_filtered"].get(
+            bucket, {"count": 0, "MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0}
+        )
+        sub_bucket = sub_result["bucket_metrics_filtered"].get(
+            bucket, {"count": 0, "MRR": 0.0, "Hits@1": 0.0, "Hits@3": 0.0, "Hits@10": 0.0}
+        )
         combined["bucket_metrics_filtered"][bucket] = {
             "count": int(obj_bucket["count"]) + int(sub_bucket["count"]),
             "MRR": 0.5 * (obj_bucket["MRR"] + sub_bucket["MRR"]),
@@ -367,14 +366,17 @@ def evaluate_branch(
     dump_path = get_branch_dump_path(args, split=split, branch=entity)
     result_path = get_branch_result_path(args, split=split, branch=entity)
 
-    all_scores = []
-    all_triples = []
+    all_scores = [] if dump_requested else None
+    all_triples = [] if dump_requested else None
 
     native_mrr = 0.0
     native_hits1 = 0.0
     native_hits3 = 0.0
     native_hits10 = 0.0
     native_count = 0
+
+    bucket_stats = init_bucket_stats()
+    stale_state = {"count": 0, "stale_top1_count": 0}
 
     train_tensor = torch.LongTensor(train_data)
     valid_tensor = torch.LongTensor(valid_data)
@@ -397,16 +399,19 @@ def evaluate_branch(
             device=device,
         )
 
-        scores = model(
-            batch_data,
-            one_hot_tail_seq,
-            entity=entity,
-            history_context=history_context,
-        )
+        with torch.no_grad():
+            scores = model(
+                batch_data,
+                one_hot_tail_seq,
+                entity=entity,
+                history_context=history_context,
+            )
 
         if args.raw:
             batch_mrr, batch_hits1, batch_hits3, batch_hits10 = calc_raw_mrr(
-                scores, torch.LongTensor(batch_data[:, 2] if entity == "object" else batch_data[:, 0]).to(device), hits=[1, 3, 10]
+                scores,
+                torch.LongTensor(batch_data[:, 2] if entity == "object" else batch_data[:, 0]).to(device),
+                hits=[1, 3, 10],
             )
         else:
             if split == "valid":
@@ -438,13 +443,30 @@ def evaluate_branch(
         native_hits10 += batch_hits10 * batch_n
         native_count += batch_n
 
-        all_scores.append(scores.detach().cpu().numpy().astype(np.float32))
-        all_triples.append(batch_data.astype(np.int64))
+        scores_np = scores.detach().cpu().numpy().astype(np.float32)
+        triples_np = batch_data.astype(np.int64)
 
-    all_scores_np = np.concatenate(all_scores, axis=0)
-    all_triples_np = np.concatenate(all_triples, axis=0)
+        update_bucket_and_stale_from_batch(
+            scores_np=scores_np,
+            triples_np=triples_np,
+            entity=entity,
+            num_r=num_r,
+            filter_map=filter_map,
+            sr_hist=sr_hist,
+            so_hist=so_hist,
+            ro_hist=ro_hist,
+            bucket_stats=bucket_stats,
+            stale_state=stale_state,
+        )
+
+        if dump_requested:
+            all_scores.append(scores_np)
+            all_triples.append(triples_np)
 
     if dump_requested:
+        all_scores_np = np.concatenate(all_scores, axis=0)
+        all_triples_np = np.concatenate(all_triples, axis=0)
+
         ensure_dir(os.path.dirname(dump_path))
         np.savez_compressed(
             dump_path,
@@ -453,16 +475,12 @@ def evaluate_branch(
             entity=np.array([entity]),
         )
 
-    bucket_metrics_filtered, stale_top1 = evaluate_bucket_and_stale(
-        scores_np=all_scores_np,
-        triples_np=all_triples_np,
-        entity=entity,
-        num_r=num_r,
-        filter_map=filter_map,
-        sr_hist=sr_hist,
-        so_hist=so_hist,
-        ro_hist=ro_hist,
-    )
+    bucket_metrics_filtered = finalize_bucket_stats(bucket_stats)
+    stale_top1 = {
+        "count": int(stale_state["count"]),
+        "stale_top1_count": int(stale_state["stale_top1_count"]),
+        "stale_top1_rate": safe_div(stale_state["stale_top1_count"], stale_state["count"]),
+    }
 
     result = {
         "row_name": args.row_name,
